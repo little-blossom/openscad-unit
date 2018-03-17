@@ -1,0 +1,264 @@
+#!/bin/bash
+
+set -e
+set -o pipefail
+
+#-----------------------------------------------------------
+EXPECTATIONS_DIR_ABS="$PWD/test-expectations"
+RESULTS_DIR_ABS="$PWD/test-results"
+
+FAILED_TESTS_COUNT=0
+PASSED_TESTS_COUNT=0
+TREATED_PNGS=()
+
+VERBOSITY=0
+
+FILE=
+TEST=
+MODE="check"
+
+#-----------------------------------------------------------
+print_help() {
+    cat <<EOF
+$0 [ OPTIONS ]
+
+OPTIONS:
+  --help              -- Prints this page
+  --generate          -- Instead of checking test output, store generated
+                         output as expected output for future checks.
+  --only-file FILE    -- Only run tests for file FILE
+  --only-test TEST    -- When using --only-file, only run test TEST.
+  --verbose           -- Increase verbosity
+EOF
+}
+
+#-----------------------------------------------------------
+parse_arguments() {
+    while [ $# -gt 0 ]
+    do
+        local ARGUMENT="$1"
+        shift
+        case "$ARGUMENT" in
+            "--help" )
+                print_help
+                exit 1
+                ;;
+            "--generate" )
+                MODE="generate"
+                ;;
+            "--only-file" )
+                [[ $# -gt 0 ]] || error "$ARGUMENT expects a further argument"
+                FILE="$1"
+                shift
+                ;;
+            "--only-test" )
+                [[ $# -gt 0 ]] || error "$ARGUMENT expects a further argument"
+                TEST="$1"
+                shift
+                ;;
+            "--verbose" )
+                VERBOSITY="$((VERBOSITY-10))"
+                ;;
+            * )
+                error "Unknown argument '$ARGUMENT'"
+                ;;
+        esac
+    done
+}
+
+#-----------------------------------------------------------
+log() {
+    local LEVEL="$1"
+    shift
+    echo "$LEVEL" "$@"
+}
+
+#-----------------------------------------------------------
+debug() {
+    if [ "$VERBOSITY" -lt -9 ]
+    then
+        log "DEBUG" "$@"
+    fi
+}
+
+#-----------------------------------------------------------
+info() {
+    log "INFO" "$@"
+}
+
+#-----------------------------------------------------------
+warn() {
+    log "WARN" "$@"
+}
+
+#-----------------------------------------------------------
+fatal() {
+    log "FATAL" "$@"
+    exit 1
+}
+
+#-----------------------------------------------------------
+fail_test() {
+    local FILE="$1"
+    local TEST="$2"
+    local REASON="$3"
+    warn "$FILE: $TEST ... fail: $REASON"
+    FAILED_TESTS_COUNT=$((FAILED_TESTS_COUNT + 1))
+}
+
+#-----------------------------------------------------------
+pass_test() {
+    local FILE="$1"
+    local TEST="$2"
+    info "$FILE: $TEST ... pass"
+    PASSED_TESTS_COUNT=$((PASSED_TESTS_COUNT + 1))
+}
+
+#-----------------------------------------------------------
+dump_array() {
+    for ENTRY in "$@"
+    do
+        echo "$ENTRY"
+    done \
+        | sort
+}
+
+#-----------------------------------------------------------
+run_test() {
+    local FILE="$1"
+    local TEST="$2"
+    info "$FILE: $TEST"
+    EXPECTED_FILE_ABS="$EXPECTATIONS_DIR_ABS/$FILE/$TEST.png"
+    TREATED_PNGS+=("$EXPECTED_FILE_ABS")
+
+    FILE_RESULTS_DIR_ABS="$RESULTS_DIR_ABS/$FILE"
+    mkdir -p "$FILE_RESULTS_DIR_ABS"
+
+    LOG_FILE_ABS="$FILE_RESULTS_DIR_ABS/$TEST.log"
+    PNG_FILE_ABS="$FILE_RESULTS_DIR_ABS/$TEST.png"
+
+    TEST_RUN_FILE="$FILE_RESULTS_DIR_ABS/$TEST.scad"
+    cat >"$TEST_RUN_FILE" <<EOF
+use <$FILE>
+
+$TEST();
+EOF
+
+    OPENSCAD_COMMAND=(
+        openscad
+        --render
+        --camera=0,0,0,55,0,25,50
+        --imgsize=512,512
+        --projection=p
+        -o "$PNG_FILE_ABS"
+        "$TEST_RUN_FILE"
+    )
+
+    debug "${OPENSCAD_COMMAND[@]}"
+    if "${OPENSCAD_COMMAND[@]}" &>"$LOG_FILE_ABS"
+    then
+        if grep --quiet '^\(ERROR\|WARNING\)' "$LOG_FILE_ABS"
+        then
+            fail_test "$FILE" "$TEST" "There were errors/warnings: $(grep '^\(ERROR\|WARNING\)' "$LOG_FILE_ABS")"
+        else
+            case "$MODE" in
+                "generate" )
+                    mkdir -p "$(dirname "$EXPECTED_FILE_ABS")"
+                    cp "$PNG_FILE_ABS" "$EXPECTED_FILE_ABS"
+                    ;;
+                "check" )
+                    if [ -f "$EXPECTED_FILE_ABS" ]
+                    then
+                        if diff --brief "$PNG_FILE_ABS" "$EXPECTED_FILE_ABS" >>"$LOG_FILE_ABS"
+                        then
+                            pass_test "$FILE" "$TEST"
+                        else
+                            compare "$PNG_FILE_ABS" "$EXPECTED_FILE_ABS" "$FILE_RESULTS_DIR_ABS/$TEST.diff.png" || true
+                            fail_test "$FILE" "$TEST" "Current output '$PNG_FILE_ABS' and expected output '$EXPECTED_FILE_ABS' differ"
+                        fi
+                    else
+                        fail_test "$FILE" "$TEST" "File with expected test results ('$EXPECTED_FILE_ABS') does not exist"
+                    fi
+                    ;;
+                * )
+                    error "Unknown mode '$MODE'"
+            esac
+        fi
+    else
+        fail_test "$FILE" "$TEST" "Failed to render test output"
+    fi
+}
+
+#-----------------------------------------------------------
+run_tests_for_file() {
+    local FILE="$1"
+    info Running tests for "$FILE"
+
+    while read TEST_LINE
+    do
+        TEST="${TEST_LINE#module }"
+        TEST="${TEST%%(*}"
+
+        run_test "$FILE" "$TEST"
+    done < <(grep "^module test" <"$FILE" || true)
+}
+
+#-----------------------------------------------------------
+run_all_tests() {
+    while read FILE
+    do
+        run_tests_for_file "$FILE"
+    done < <(find * -type f -name '*.scad' | sort)
+}
+
+#-----------------------------------------------------------
+check_missed_tests() {
+    if ! diff <(dump_array "${TREATED_PNGS[@]}") <(find "$EXPECTATIONS_DIR_ABS/" -type f -name '*.png' | sort)
+    then
+        fatal "^ mismatch between run tests and expected tests"
+    fi
+}
+
+#-----------------------------------------------------------
+parse_arguments "$@"
+
+case "$MODE" in
+    "generate" )
+        :
+        ;;
+    "check" )
+        rm -rf "$RESULTS_DIR_ABS"
+        ;;
+    * )
+        error "Unknown mode '$MODE'"
+esac
+
+if [ -n "$FILE" ]
+then
+    if [ -n "$TEST" ]
+    then
+        run_test "$FILE" "$TEST"
+    else
+        run_tests_for_file "$FILE"
+    fi
+else
+    run_all_tests
+    check_missed_tests
+fi
+
+cat <<EOF
+
+------------------------------------------------------------------------
+
+  Total  tests: $((PASSED_TESTS_COUNT + FAILED_TESTS_COUNT))
+  Passed tests: $PASSED_TESTS_COUNT
+  Failed tests: $FAILED_TESTS_COUNT
+
+EOF
+
+if [ "$FAILED_TESTS_COUNT" -ne 0 ]
+then
+    fatal "There were $FAILED_TESTS_COUNT failed tests"
+else
+    info "All tests run and all passed."
+fi
