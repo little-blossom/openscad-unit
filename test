@@ -139,7 +139,7 @@ run_test() {
 
     TEST_RUN_FILE="$FILE_RESULTS_DIR_ABS/$TEST.scad"
     cat >"$TEST_RUN_FILE" <<EOF
-use <$FILE>
+use <$PWD/$FILE>
 
 $TEST();
 EOF
